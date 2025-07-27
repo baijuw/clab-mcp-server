@@ -14,6 +14,16 @@ docker build . -t clab-mcp-server
 docker build . --build-arg HTTP_PROXY=<proxy server> --build-arg HTTPS_PROXY=<proxy server> --build-arg NO_PROXY=<subnets to skip> -t clab-mcp-server
 ```
 
+## Docker Run
+
+Run the ContainerLab MCP server in a container:
+
+```bash
+docker run -d -p 8989:8989 clab-mcp-server
+```
+
+**Port 8989** is used because the MCP server inside the container listens on port 8989. The port mapping `-p 8989:8989` makes the server accessible from the host.
+
 ## Available Tools
 
 - **get_clab_linux_nodes** - Discover and inventory all ContainerLab Linux nodes with their network interface details
