@@ -1,6 +1,7 @@
 # ContainerLab MCP Server
 
-This MCP (Model Context Protocol) server provides tools for interacting with ContainerLab Linux containers via Docker. It enables network configuration, connectivity testing, and routing management for network lab environments.
+This MCP (Model Context Protocol) server provides tools for interacting with ContainerLab Linux containers acting as network clients. It enables network configuration, connectivity testing, and routing management for network clients in the lab environments. 
+This MCP server is limited to discovering and automating tasks on clab nodes of type Linux.
 
 ## Docker Build
 
