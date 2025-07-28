@@ -17,6 +17,8 @@ docker build . --build-arg HTTP_PROXY=<proxy server> --build-arg HTTPS_PROXY=<pr
 
 ## Docker Run
 
+**Important:** This MCP server connects to the CLAB server using Docker TCP transport. The CLAB Docker service must be enabled to be managed by Docker TCP-based commands.
+
 Run the ContainerLab MCP server in a container:
 
 ```bash
