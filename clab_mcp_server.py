@@ -534,6 +534,14 @@ def test_connectivity(
     The tool sends 3 ping packets with a 2-second timeout per packet, providing
     reliable connectivity testing suitable for network validation and troubleshooting.
     
+    Troubleshooting ping failures:
+    - Same subnet (L2): If the remote IP is in the same subnet and the ping fails, check that 
+      the BridgeDomain type is EVPNVXLAN. When the L2 domain is stretched across leaf switches, 
+      a BridgeDomain type of SIMPLE will not establish connectivity.
+    - Different subnet (L3): If the remote IP is in a different subnet, first ensure that a 
+      route exists on both the client for connectivity (either a specific route to the 
+      destination or a default route).
+    
     Args:
         container_name: Name of the source ContainerLab container to ping from
         destination_ip: Target IP address to test connectivity to (can be another container, gateway, or external IP)
