@@ -10,6 +10,8 @@ import logging
 import json
 import subprocess
 import sys
+import os
+import argparse
 from fastmcp import FastMCP
 
 logger = logging.getLogger(__name__)
@@ -47,9 +49,18 @@ class ContainerLabClient:
 # Global client instance - will be initialized when server starts
 clab_client: Optional[ContainerLabClient] = None
 
-def initialize_client(docker_host_ip: str = "10.58.65.16", port: int = 2375, tls: bool = False):
+def initialize_client(docker_host_ip: str = None, port: int = None, tls: bool = False):
     """Initialize the global ContainerLabClient instance."""
     global clab_client
+    
+    # Use environment variable if docker_host_ip not provided
+    if docker_host_ip is None:
+        docker_host_ip = os.getenv('DOCKER_HOST_IP', 'localhost')
+    
+    # Use environment variable if port not provided
+    if port is None:
+        port = int(os.getenv('DOCKER_PORT', '2375'))
+    
     clab_client = ContainerLabClient(docker_host_ip, port, tls)
 
 @mcp.tool
@@ -760,8 +771,23 @@ def add_static_route(
             client.close()
 
 if __name__ == "__main__":
-    # Initialize the client
-    initialize_client()
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='ContainerLab MCP Server')
+    parser.add_argument('--docker-host-ip', type=str, default=None,
+                        help='Docker host IP address (default: localhost, or set DOCKER_HOST_IP env var)')
+    parser.add_argument('--docker-port', type=int, default=2375,
+                        help='Docker daemon port (default: 2375)')
+    parser.add_argument('--docker-tls', action='store_true', default=False,
+                        help='Use TLS for Docker connection (default: False)')
+    parser.add_argument('--mcp-host', type=str, default="0.0.0.0",
+                        help='MCP server host (default: 0.0.0.0)')
+    parser.add_argument('--mcp-port', type=int, default=8989,
+                        help='MCP server port (default: 8989)')
+    
+    args = parser.parse_args()
+    
+    # Initialize the client with provided arguments
+    initialize_client(docker_host_ip=args.docker_host_ip, port=args.docker_port, tls=args.docker_tls)
     
     # Run the FastMCP server
-    mcp.run(transport="http", host="0.0.0.0", port=8989,log_level="debug")
+    mcp.run(transport="http", host=args.mcp_host, port=args.mcp_port, log_level="debug")
