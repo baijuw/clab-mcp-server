@@ -56,13 +56,13 @@ docker run -d -p 8989:8989 clab-mcp-server
 
 ### Run with Custom Docker Host IP
 ```bash
-docker run -d -p 8989:8989 -e DOCKER_HOST_IP=10.58.65.16 clab-mcp-server
+docker run -d -p 8989:8989 -e DOCKER_HOST_IP=<docker-host-ip> clab-mcp-server
 ```
 
 ### Run with Multiple Environment Variables
 ```bash
 docker run -d -p 8989:8989 \
-  -e DOCKER_HOST_IP=10.58.65.16 \
+  -e DOCKER_HOST_IP=<docker-host-ip> \
   -e DOCKER_PORT=2375 \
   clab-mcp-server
 ```
