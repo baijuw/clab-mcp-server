@@ -77,3 +77,4 @@ docker run -d -p 8989:8989 \
 - **delete_vlan_interface** - Remove VLAN interfaces and clean up network configuration
 - **test_connectivity** - Verify network connectivity between containers using ping
 - **add_static_route** - Add static routes to container routing tables for L3 domain testing
+- **create_bond_interface** - Create bond interfaces for network redundancy and load balancing

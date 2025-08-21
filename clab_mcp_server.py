@@ -620,6 +620,265 @@ def test_connectivity(
             client.close()
 
 @mcp.tool
+def create_bond_interface(
+    container_name: str,
+    bond_name: str,
+    slave_interfaces: List[str],
+    bond_mode: str = "active-backup",
+    miimon: int = 100
+) -> Dict:
+    """
+    Create a bond interface in a ContainerLab container for network redundancy and load balancing.
+    
+    This tool creates a bonded network interface by combining multiple physical interfaces
+    into a single logical interface. Bond interfaces provide:
+    - Network redundancy (failover protection)
+    - Load balancing across multiple links
+    - Increased bandwidth aggregation
+    - High availability networking
+    
+    The tool performs the following operations:
+    1. Creates a new bond interface with specified name
+    2. Configures the bonding mode and monitoring parameters
+    3. Adds slave interfaces to the bond
+    4. Brings up the bond interface and slave interfaces
+    
+    Common bonding modes:
+    - active-backup: One interface active, others standby (fault tolerance)
+    - balance-rr: Round-robin load balancing
+    - balance-xor: XOR hash load balancing
+    - broadcast: Transmit on all interfaces
+    - 802.3ad: IEEE 802.3ad dynamic link aggregation (LACP)
+    - balance-tlb: Adaptive transmit load balancing
+    - balance-alb: Adaptive load balancing
+    
+    Use this tool when you need to:
+    - Create redundant network connections for high availability
+    - Aggregate bandwidth from multiple interfaces
+    - Implement network load balancing
+    - Set up fault-tolerant network configurations
+    - Test network failover scenarios in lab environments
+    - Configure LACP (802.3ad) aggregation
+    
+    Args:
+        container_name: Name of the ContainerLab container to configure
+        bond_name: Name for the new bond interface (e.g., 'bond0', 'bond1')
+        slave_interfaces: List of interface names to add to the bond (e.g., ['eth1', 'eth2'])
+        bond_mode: Bonding mode - options: active-backup, balance-rr, balance-xor, broadcast, 802.3ad, balance-tlb, balance-alb (default: 'active-backup')
+        miimon: MII monitoring interval in milliseconds (default: 100)
+    
+    Returns:
+        Dictionary containing:
+        - status: 'success' or 'error'
+        - messages: List of configuration steps performed
+        - bond_name, slave_interfaces, bond_mode, miimon: Configuration details
+        - container: Container name
+        - error: Error message if operation failed
+        
+    Raises:
+        docker.errors.DockerException: If container is not found or not accessible
+        ValueError: If slave interfaces are invalid or bond mode is unsupported
+        RuntimeError: If bond creation fails due to system constraints
+    """
+    result = {
+        "status": "success",
+        "container": container_name,
+        "bond_name": bond_name,
+        "slave_interfaces": slave_interfaces,
+        "bond_mode": bond_mode,
+        "miimon": miimon,
+        "messages": []
+    }
+    
+    try:
+        if clab_client is None:
+            raise RuntimeError("ContainerLab client not initialized. Call initialize_client() first.")
+        
+        # Validate inputs
+        if not slave_interfaces or len(slave_interfaces) < 2:
+            error_msg = "At least 2 slave interfaces are required for bonding"
+            logger.error(error_msg)
+            result["status"] = "error"
+            result["error"] = error_msg
+            return result
+        
+        # Validate bond mode
+        valid_modes = ["active-backup", "balance-rr", "balance-xor", "broadcast", "802.3ad", "balance-tlb", "balance-alb"]
+        if bond_mode not in valid_modes:
+            error_msg = f"Invalid bond mode '{bond_mode}'. Valid modes: {', '.join(valid_modes)}"
+            logger.error(error_msg)
+            result["status"] = "error"
+            result["error"] = error_msg
+            return result
+        
+        # Protection: Prevent any actions on eth0 interface
+        for interface in slave_interfaces:
+            if interface.lower() == "eth0":
+                error_msg = "Operation not allowed on eth0 interface - this is the management interface"
+                logger.error(error_msg)
+                result["status"] = "error"
+                result["error"] = error_msg
+                return result
+        
+        if clab_client.tls:
+            if clab_client.cert_path and clab_client.key_path:
+                tls_config = docker.tls.TLSConfig(
+                    client_cert=(clab_client.cert_path, clab_client.key_path),
+                    ca_cert=clab_client.ca_cert_path,
+                    verify=True
+                )
+            else:
+                tls_config = docker.tls.TLSConfig(
+                    ca_cert=clab_client.ca_cert_path,
+                    verify=True
+                )
+            base_url = f"https://{clab_client.docker_host_ip}:{clab_client.port}"
+        else:
+            tls_config = None
+            base_url = f"tcp://{clab_client.docker_host_ip}:{clab_client.port}"
+
+        # Connect to Docker daemon
+        client = docker.DockerClient(base_url=base_url, tls=tls_config)
+        
+        # Get the container
+        container = client.containers.get(container_name)
+        
+        # Step 1: Load bonding module (if not already loaded)
+        try:
+            modprobe_cmd = "modprobe bonding"
+            exec_result = container.exec_run(modprobe_cmd)
+            
+            if exec_result.exit_code == 0:
+                success_msg = "Bonding module loaded successfully"
+                result["messages"].append(success_msg)
+                logger.info(success_msg)
+            else:
+                # Module might already be loaded, check if it's just a warning
+                output = exec_result.output.decode('utf-8') if exec_result.output else ""
+                if "already loaded" not in output.lower():
+                    warn_msg = f"Bonding module load warning: {output}"
+                    result["messages"].append(warn_msg)
+                    logger.warning(warn_msg)
+        except Exception as e:
+            error_msg = f"Error loading bonding module: {str(e)}"
+            logger.error(error_msg)
+            result["status"] = "error"
+            result["error"] = error_msg
+            return result
+        
+        # Step 2: Create bond interface
+        try:
+            create_bond_cmd = f"ip link add {bond_name} type bond mode {bond_mode} miimon {miimon}"
+            exec_result = container.exec_run(create_bond_cmd)
+            
+            if exec_result.exit_code == 0:
+                success_msg = f"Bond interface {bond_name} created successfully with mode {bond_mode}"
+                result["messages"].append(success_msg)
+                logger.info(success_msg)
+            else:
+                # Check if interface already exists
+                output = exec_result.output.decode('utf-8') if exec_result.output else ""
+                if "File exists" in output:
+                    info_msg = f"Bond interface {bond_name} already exists"
+                    result["messages"].append(info_msg)
+                    logger.info(info_msg)
+                else:
+                    error_msg = f"Failed to create bond interface {bond_name}: {output}"
+                    logger.error(error_msg)
+                    result["status"] = "error"
+                    result["error"] = error_msg
+                    return result
+        except Exception as e:
+            error_msg = f"Error creating bond interface: {str(e)}"
+            logger.error(error_msg)
+            result["status"] = "error"
+            result["error"] = error_msg
+            return result
+        
+        # Step 3: Add slave interfaces to bond
+        for slave_interface in slave_interfaces:
+            try:
+                # First, bring down the slave interface
+                down_cmd = f"ip link set {slave_interface} down"
+                exec_result = container.exec_run(down_cmd)
+                
+                if exec_result.exit_code == 0:
+                    msg = f"Interface {slave_interface} brought down"
+                    result["messages"].append(msg)
+                    logger.info(msg)
+                
+                # Add slave to bond
+                add_slave_cmd = f"ip link set {slave_interface} master {bond_name}"
+                exec_result = container.exec_run(add_slave_cmd)
+                
+                if exec_result.exit_code == 0:
+                    success_msg = f"Added {slave_interface} as slave to bond {bond_name}"
+                    result["messages"].append(success_msg)
+                    logger.info(success_msg)
+                else:
+                    error_msg = f"Failed to add {slave_interface} to bond {bond_name}: {exec_result.output.decode('utf-8')}"
+                    logger.error(error_msg)
+                    result["status"] = "error"
+                    result["error"] = error_msg
+                    return result
+                
+                # Bring slave interface back up
+                up_cmd = f"ip link set {slave_interface} up"
+                exec_result = container.exec_run(up_cmd)
+                
+                if exec_result.exit_code == 0:
+                    msg = f"Interface {slave_interface} brought up as bond slave"
+                    result["messages"].append(msg)
+                    logger.info(msg)
+                
+            except Exception as e:
+                error_msg = f"Error adding slave interface {slave_interface}: {str(e)}"
+                logger.error(error_msg)
+                result["status"] = "error"
+                result["error"] = error_msg
+                return result
+        
+        # Step 4: Bring up the bond interface
+        try:
+            up_bond_cmd = f"ip link set {bond_name} up"
+            exec_result = container.exec_run(up_bond_cmd)
+            
+            if exec_result.exit_code == 0:
+                success_msg = f"Bond interface {bond_name} brought up successfully"
+                result["messages"].append(success_msg)
+                logger.info(success_msg)
+            else:
+                error_msg = f"Failed to bring up bond interface {bond_name}: {exec_result.output.decode('utf-8')}"
+                logger.error(error_msg)
+                result["status"] = "error"
+                result["error"] = error_msg
+                return result
+        except Exception as e:
+            error_msg = f"Error bringing up bond interface: {str(e)}"
+            logger.error(error_msg)
+            result["status"] = "error"
+            result["error"] = error_msg
+            return result
+        
+        return result
+        
+    except Exception as e:
+        error_msg = f"Unexpected error in create_bond_interface: {str(e)}"
+        logger.error(error_msg)
+        return {
+            "status": "error",
+            "container": container_name,
+            "bond_name": bond_name,
+            "slave_interfaces": slave_interfaces,
+            "bond_mode": bond_mode,
+            "miimon": miimon,
+            "error": error_msg
+        }
+    finally:
+        if 'client' in locals():
+            client.close()
+
+@mcp.tool
 def add_static_route(
     container_name: str,
     destination_network: str,
