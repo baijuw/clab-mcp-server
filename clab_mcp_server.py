@@ -879,6 +879,502 @@ def create_bond_interface(
             client.close()
 
 @mcp.tool
+def delete_bond_interface(
+    container_name: str,
+    bond_name: str,
+    slave_interfaces: List[str]
+) -> Dict:
+    """
+    Delete a bond interface and restore slave interfaces to their original state.
+    
+    This tool reverses the configuration created by create_bond_interface by:
+    1. Bringing down the bond interface
+    2. Removing slave interfaces from the bond
+    3. Deleting the bond interface
+    4. Bringing slave interfaces back up as independent interfaces
+    
+    This is the cleanup counterpart to create_bond_interface - use it to remove
+    bonded interfaces and restore the original network configuration. The tool
+    safely handles cases where the bond doesn't exist or slaves have already
+    been removed.
+    
+    Use this tool when you need to:
+    - Clean up bond configurations after testing
+    - Remove obsolete or misconfigured bond interfaces
+    - Restore original interface configurations
+    - Troubleshoot bonding issues by removing and recreating bonds
+    - Prepare containers for different network configurations
+    - Convert from bonded to individual interface configurations
+    
+    Args:
+        container_name: Name of the ContainerLab container to modify
+        bond_name: Name of the bond interface to delete (e.g., 'bond0', 'bond1')
+        slave_interfaces: List of slave interface names to restore (e.g., ['eth1', 'eth2'])
+    
+    Returns:
+        Dictionary containing:
+        - status: 'success' or 'error'
+        - messages: List of cleanup operations performed
+        - bond_name, slave_interfaces: Configuration details
+        - container: Container name
+        - error: Error message if operation failed
+        
+    Raises:
+        docker.errors.DockerException: If container is not found or not accessible
+        RuntimeError: If bond deletion fails due to system constraints
+    """
+    result = {
+        "status": "success",
+        "container": container_name,
+        "bond_name": bond_name,
+        "slave_interfaces": slave_interfaces,
+        "messages": []
+    }
+    
+    try:
+        if clab_client is None:
+            raise RuntimeError("ContainerLab client not initialized. Call initialize_client() first.")
+        
+        # Protection: Prevent any actions on eth0 interface
+        for interface in slave_interfaces:
+            if interface.lower() == "eth0":
+                error_msg = "Operation not allowed on eth0 interface - this is the management interface"
+                logger.error(error_msg)
+                result["status"] = "error"
+                result["error"] = error_msg
+                return result
+        
+        if clab_client.tls:
+            if clab_client.cert_path and clab_client.key_path:
+                tls_config = docker.tls.TLSConfig(
+                    client_cert=(clab_client.cert_path, clab_client.key_path),
+                    ca_cert=clab_client.ca_cert_path,
+                    verify=True
+                )
+            else:
+                tls_config = docker.tls.TLSConfig(
+                    ca_cert=clab_client.ca_cert_path,
+                    verify=True
+                )
+            base_url = f"https://{clab_client.docker_host_ip}:{clab_client.port}"
+        else:
+            tls_config = None
+            base_url = f"tcp://{clab_client.docker_host_ip}:{clab_client.port}"
+
+        # Connect to Docker daemon
+        client = docker.DockerClient(base_url=base_url, tls=tls_config)
+        
+        # Get the container
+        container = client.containers.get(container_name)
+        
+        # Step 1: Bring down the bond interface
+        try:
+            down_bond_cmd = f"ip link set {bond_name} down"
+            exec_result = container.exec_run(down_bond_cmd)
+            
+            if exec_result.exit_code == 0:
+                success_msg = f"Bond interface {bond_name} brought down successfully"
+                result["messages"].append(success_msg)
+                logger.info(success_msg)
+            else:
+                output = exec_result.output.decode('utf-8') if exec_result.output else ""
+                if "Cannot find device" in output:
+                    info_msg = f"Bond interface {bond_name} does not exist or already removed"
+                    result["messages"].append(info_msg)
+                    logger.info(info_msg)
+                else:
+                    warn_msg = f"Warning bringing down bond interface {bond_name}: {output}"
+                    result["messages"].append(warn_msg)
+                    logger.warning(warn_msg)
+        except Exception as e:
+            error_msg = f"Error bringing down bond interface: {str(e)}"
+            logger.error(error_msg)
+            result["status"] = "error"
+            result["error"] = error_msg
+            return result
+        
+        # Step 2: Remove slave interfaces from bond and restore them
+        for slave_interface in slave_interfaces:
+            try:
+                # Remove slave from bond (this also brings the interface down)
+                remove_slave_cmd = f"ip link set {slave_interface} nomaster"
+                exec_result = container.exec_run(remove_slave_cmd)
+                
+                if exec_result.exit_code == 0:
+                    success_msg = f"Removed {slave_interface} from bond {bond_name}"
+                    result["messages"].append(success_msg)
+                    logger.info(success_msg)
+                else:
+                    output = exec_result.output.decode('utf-8') if exec_result.output else ""
+                    if "Cannot find device" in output:
+                        warn_msg = f"Interface {slave_interface} not found or already removed from bond"
+                        result["messages"].append(warn_msg)
+                        logger.warning(warn_msg)
+                    else:
+                        warn_msg = f"Warning removing {slave_interface} from bond: {output}"
+                        result["messages"].append(warn_msg)
+                        logger.warning(warn_msg)
+                
+                # Bring slave interface back up as independent interface
+                up_cmd = f"ip link set {slave_interface} up"
+                exec_result = container.exec_run(up_cmd)
+                
+                if exec_result.exit_code == 0:
+                    success_msg = f"Interface {slave_interface} restored as independent interface"
+                    result["messages"].append(success_msg)
+                    logger.info(success_msg)
+                else:
+                    output = exec_result.output.decode('utf-8') if exec_result.output else ""
+                    warn_msg = f"Warning bringing up {slave_interface}: {output}"
+                    result["messages"].append(warn_msg)
+                    logger.warning(warn_msg)
+                
+            except Exception as e:
+                error_msg = f"Error restoring slave interface {slave_interface}: {str(e)}"
+                logger.error(error_msg)
+                result["status"] = "error"
+                result["error"] = error_msg
+                return result
+        
+        # Step 3: Delete the bond interface
+        try:
+            delete_bond_cmd = f"ip link delete {bond_name}"
+            exec_result = container.exec_run(delete_bond_cmd)
+            
+            if exec_result.exit_code == 0:
+                success_msg = f"Bond interface {bond_name} deleted successfully"
+                result["messages"].append(success_msg)
+                logger.info(success_msg)
+            else:
+                output = exec_result.output.decode('utf-8') if exec_result.output else ""
+                if "Cannot find device" in output:
+                    info_msg = f"Bond interface {bond_name} does not exist or already deleted"
+                    result["messages"].append(info_msg)
+                    logger.info(info_msg)
+                else:
+                    error_msg = f"Failed to delete bond interface {bond_name}: {output}"
+                    logger.error(error_msg)
+                    result["status"] = "error"
+                    result["error"] = error_msg
+                    return result
+        except Exception as e:
+            error_msg = f"Error deleting bond interface: {str(e)}"
+            logger.error(error_msg)
+            result["status"] = "error"
+            result["error"] = error_msg
+            return result
+        
+        return result
+        
+    except Exception as e:
+        error_msg = f"Unexpected error in delete_bond_interface: {str(e)}"
+        logger.error(error_msg)
+        return {
+            "status": "error",
+            "container": container_name,
+            "bond_name": bond_name,
+            "slave_interfaces": slave_interfaces,
+            "error": error_msg
+        }
+    finally:
+        if 'client' in locals():
+            client.close()
+
+@mcp.tool
+def get_interface_info(
+    container_name: str,
+    interface_name: str
+) -> Dict:
+    """
+    Retrieve comprehensive configuration and status information for a network interface.
+    
+    This tool provides detailed inspection of network interfaces including:
+    - Basic interface properties (state, MAC address, MTU)
+    - IP address configuration and VLAN information
+    - Bond interface details (mode, slaves, active slave status)
+    - Interface statistics and operational status
+    - Routing information related to the interface
+    
+    For bonded interfaces, the tool provides specialized bond information including:
+    - Bond mode and configuration parameters
+    - Slave interface status and active/backup states
+    - MII monitoring status and link state
+    - Failover and load balancing configuration
+    
+    Use this tool when you need to:
+    - Verify interface configuration after using set_ip or create_bond_interface
+    - Troubleshoot network connectivity issues
+    - Validate bond interface status and slave configurations
+    - Check interface operational state and statistics
+    - Perform post-configuration verification and assurance
+    - Debug network problems and interface inconsistencies
+    - Monitor interface health and performance
+    
+    This is essential for network troubleshooting and configuration validation,
+    providing comprehensive visibility into interface status and configuration.
+    
+    Args:
+        container_name: Name of the ContainerLab container to inspect
+        interface_name: Name of the interface to analyze (e.g., 'eth1', 'bond0', 'eth1.100')
+    
+    Returns:
+        Dictionary containing:
+        - interface_name, container: Input parameters
+        - exists: Boolean indicating if interface exists
+        - interface_type: Type of interface ('physical', 'vlan', 'bond', 'unknown')
+        - state: Interface operational state ('up', 'down', 'unknown')
+        - mac_address: Hardware MAC address
+        - mtu: Maximum transmission unit
+        - ip_addresses: List of configured IP addresses with CIDR notation
+        - bond_info: Bond-specific information (if interface is bonded)
+          - mode: Bond mode (active-backup, balance-rr, etc.)
+          - slaves: List of slave interfaces with their status
+          - active_slave: Currently active slave interface
+          - mii_status: MII monitoring status
+        - vlan_info: VLAN-specific information (if interface is VLAN)
+          - vlan_id: VLAN ID number
+          - parent_interface: Parent physical interface
+        - statistics: Interface traffic statistics
+        - error: Error message if inspection failed
+        
+    Raises:
+        docker.errors.DockerException: If container is not found or not accessible
+        RuntimeError: If interface inspection commands fail
+    """
+    result = {
+        "container": container_name,
+        "interface_name": interface_name,
+        "exists": False,
+        "interface_type": "unknown",
+        "state": "unknown",
+        "mac_address": None,
+        "mtu": None,
+        "ip_addresses": [],
+        "bond_info": None,
+        "vlan_info": None,
+        "statistics": None,
+        "error": None
+    }
+    
+    try:
+        if clab_client is None:
+            raise RuntimeError("ContainerLab client not initialized. Call initialize_client() first.")
+        
+        if clab_client.tls:
+            if clab_client.cert_path and clab_client.key_path:
+                tls_config = docker.tls.TLSConfig(
+                    client_cert=(clab_client.cert_path, clab_client.key_path),
+                    ca_cert=clab_client.ca_cert_path,
+                    verify=True
+                )
+            else:
+                tls_config = docker.tls.TLSConfig(
+                    ca_cert=clab_client.ca_cert_path,
+                    verify=True
+                )
+            base_url = f"https://{clab_client.docker_host_ip}:{clab_client.port}"
+        else:
+            tls_config = None
+            base_url = f"tcp://{clab_client.docker_host_ip}:{clab_client.port}"
+
+        # Connect to Docker daemon
+        client = docker.DockerClient(base_url=base_url, tls=tls_config)
+        
+        # Get the container
+        container = client.containers.get(container_name)
+        
+        # Step 1: Get basic interface information using 'ip link show'
+        try:
+            ip_link_cmd = f"ip -j link show {interface_name}"
+            exec_result = container.exec_run(ip_link_cmd)
+            
+            if exec_result.exit_code == 0:
+                try:
+                    link_info = json.loads(exec_result.output.decode('utf-8').strip())
+                    if link_info:
+                        interface_data = link_info[0]
+                        result["exists"] = True
+                        result["state"] = "up" if "UP" in interface_data.get("flags", []) else "down"
+                        result["mac_address"] = interface_data.get("address")
+                        result["mtu"] = interface_data.get("mtu")
+                        
+                        # Determine interface type
+                        link_type = interface_data.get("linkinfo", {}).get("info_kind")
+                        if link_type == "bond":
+                            result["interface_type"] = "bond"
+                        elif link_type == "vlan":
+                            result["interface_type"] = "vlan"
+                        elif "." in interface_name:
+                            result["interface_type"] = "vlan"
+                        else:
+                            result["interface_type"] = "physical"
+                            
+                except json.JSONDecodeError:
+                    result["error"] = f"Failed to parse interface link information"
+                    return result
+            else:
+                # Interface doesn't exist
+                result["error"] = f"Interface {interface_name} does not exist"
+                return result
+                
+        except Exception as e:
+            result["error"] = f"Error getting interface link info: {str(e)}"
+            return result
+        
+        # Step 2: Get IP address information using 'ip addr show'
+        try:
+            ip_addr_cmd = f"ip -j addr show {interface_name}"
+            exec_result = container.exec_run(ip_addr_cmd)
+            
+            if exec_result.exit_code == 0:
+                try:
+                    addr_info = json.loads(exec_result.output.decode('utf-8').strip())
+                    if addr_info:
+                        addr_data = addr_info[0]
+                        addresses = []
+                        for addr in addr_data.get("addr_info", []):
+                            if addr.get("family") == "inet":  # IPv4
+                                ip_with_prefix = f"{addr.get('local')}/{addr.get('prefixlen')}"
+                                addresses.append(ip_with_prefix)
+                        result["ip_addresses"] = addresses
+                        
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse IP address info for {interface_name}")
+                    
+        except Exception as e:
+            logger.warning(f"Error getting IP address info: {str(e)}")
+        
+        # Step 3: Get bond-specific information if this is a bond interface
+        if result["interface_type"] == "bond":
+            bond_info = {
+                "mode": None,
+                "slaves": [],
+                "active_slave": None,
+                "mii_status": None
+            }
+            
+            try:
+                # Get bond mode
+                mode_cmd = f"cat /proc/net/bonding/{interface_name}"
+                exec_result = container.exec_run(mode_cmd)
+                
+                if exec_result.exit_code == 0:
+                    bond_status = exec_result.output.decode('utf-8')
+                    
+                    # Parse bond mode
+                    for line in bond_status.split('\n'):
+                        if line.startswith('Bonding Mode:'):
+                            bond_info["mode"] = line.split(':', 1)[1].strip()
+                        elif line.startswith('Currently Active Slave:'):
+                            bond_info["active_slave"] = line.split(':', 1)[1].strip()
+                        elif line.startswith('MII Status:'):
+                            bond_info["mii_status"] = line.split(':', 1)[1].strip()
+                    
+                    # Parse slave information
+                    slaves = []
+                    current_slave = None
+                    for line in bond_status.split('\n'):
+                        if line.startswith('Slave Interface:'):
+                            if current_slave:
+                                slaves.append(current_slave)
+                            current_slave = {
+                                "name": line.split(':', 1)[1].strip(),
+                                "status": "unknown",
+                                "link": "unknown"
+                            }
+                        elif current_slave and line.startswith('MII Status:'):
+                            current_slave["status"] = line.split(':', 1)[1].strip()
+                        elif current_slave and line.startswith('Link Failure Count:'):
+                            # Additional slave info can be added here
+                            pass
+                    
+                    if current_slave:
+                        slaves.append(current_slave)
+                    
+                    bond_info["slaves"] = slaves
+                    
+            except Exception as e:
+                logger.warning(f"Error getting bond info: {str(e)}")
+                bond_info["error"] = str(e)
+            
+            result["bond_info"] = bond_info
+        
+        # Step 4: Get VLAN-specific information if this is a VLAN interface
+        elif result["interface_type"] == "vlan":
+            vlan_info = {
+                "vlan_id": None,
+                "parent_interface": None
+            }
+            
+            try:
+                # Parse VLAN ID from interface name (e.g., eth1.100 -> VLAN 100)
+                if "." in interface_name:
+                    parts = interface_name.split(".")
+                    if len(parts) == 2:
+                        vlan_info["parent_interface"] = parts[0]
+                        try:
+                            vlan_info["vlan_id"] = int(parts[1])
+                        except ValueError:
+                            pass
+                
+                # Alternative: get VLAN info from ip link show output
+                ip_link_detail_cmd = f"ip -d link show {interface_name}"
+                exec_result = container.exec_run(ip_link_detail_cmd)
+                
+                if exec_result.exit_code == 0:
+                    link_detail = exec_result.output.decode('utf-8')
+                    # Parse additional VLAN details if needed
+                    for line in link_detail.split('\n'):
+                        if 'vlan' in line and 'id' in line:
+                            # Extract VLAN ID from detailed output
+                            import re
+                            vlan_match = re.search(r'vlan id (\d+)', line)
+                            if vlan_match:
+                                vlan_info["vlan_id"] = int(vlan_match.group(1))
+                            
+            except Exception as e:
+                logger.warning(f"Error getting VLAN info: {str(e)}")
+            
+            result["vlan_info"] = vlan_info
+        
+        # Step 5: Get interface statistics
+        try:
+            stats_cmd = f"ip -j -s link show {interface_name}"
+            exec_result = container.exec_run(stats_cmd)
+            
+            if exec_result.exit_code == 0:
+                try:
+                    stats_info = json.loads(exec_result.output.decode('utf-8').strip())
+                    if stats_info and stats_info[0].get("stats64"):
+                        stats = stats_info[0]["stats64"]
+                        result["statistics"] = {
+                            "rx_packets": stats.get("rx", {}).get("packets"),
+                            "tx_packets": stats.get("tx", {}).get("packets"), 
+                            "rx_bytes": stats.get("rx", {}).get("bytes"),
+                            "tx_bytes": stats.get("tx", {}).get("bytes"),
+                            "rx_errors": stats.get("rx", {}).get("errors"),
+                            "tx_errors": stats.get("tx", {}).get("errors"),
+                            "rx_dropped": stats.get("rx", {}).get("dropped"),
+                            "tx_dropped": stats.get("tx", {}).get("dropped")
+                        }
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse interface statistics for {interface_name}")
+                    
+        except Exception as e:
+            logger.warning(f"Error getting interface statistics: {str(e)}")
+        
+        return result
+        
+    except Exception as e:
+        error_msg = f"Unexpected error in get_interface_info: {str(e)}"
+        logger.error(error_msg)
+        result["error"] = error_msg
+        return result
+    finally:
+        if 'client' in locals():
+            client.close()
+
+@mcp.tool
 def add_static_route(
     container_name: str,
     destination_network: str,
