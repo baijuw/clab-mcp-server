@@ -1533,6 +1533,373 @@ def add_static_route(
         if 'client' in locals():
             client.close()
 
+@mcp.tool
+def check_routes(
+    container_name: str,
+    destination_filter: Optional[str] = None
+) -> Dict:
+    """
+    Retrieve the routing table from a ContainerLab container for network troubleshooting.
+    
+    This tool displays the container's routing table using the 'ip route show' command,
+    providing comprehensive visibility into how traffic is routed within the container.
+    The routing table shows:
+    - Destination networks and host routes
+    - Gateway/next-hop IP addresses
+    - Outgoing network interfaces for each route
+    - Route metrics and administrative distances
+    - Default routes and network-specific routes
+    
+    This information is essential for:
+    - Troubleshooting inter-VLAN connectivity issues
+    - Verifying static route configurations added with add_static_route
+    - Understanding traffic flow paths in complex network topologies
+    - Diagnosing routing problems between network segments
+    - Validating network configuration in lab environments
+    - Confirming that containers have appropriate routes to reach destinations
+    
+    Use this tool when you need to:
+    - Verify that static routes have been properly configured
+    - Troubleshoot connectivity issues between different VLANs or subnets
+    - Understand how traffic flows from a container to various destinations
+    - Debug routing problems in multi-homed network configurations
+    - Validate routing table entries after network configuration changes
+    - Analyze routing paths for network optimization
+    - Confirm default gateway configurations
+    
+    The tool optionally allows filtering routes to specific destinations, which is
+    helpful when troubleshooting connectivity to particular networks or hosts.
+    
+    Args:
+        container_name: Name of the ContainerLab container to query routing table from
+        destination_filter: Optional destination network or IP to filter routes (e.g., '192.168.10.0/24', '10.0.0.1', 'default')
+        
+    Returns:
+        Dictionary containing:
+        - status: 'success' or 'error'
+        - container: Container name
+        - routes: List of route entries with destination, gateway, interface, and additional details
+        - raw_output: Raw text output from 'ip route show' command
+        - filter_applied: The destination filter that was applied (if any)
+        - route_count: Number of routes found
+        - error: Error message if operation failed
+        
+    Raises:
+        docker.errors.DockerException: If container is not found or not accessible
+        RuntimeError: If routing table query fails
+    """
+    result = {
+        "status": "success",
+        "container": container_name,
+        "routes": [],
+        "raw_output": "",
+        "filter_applied": destination_filter,
+        "route_count": 0,
+        "error": None
+    }
+    
+    try:
+        if clab_client is None:
+            raise RuntimeError("ContainerLab client not initialized. Call initialize_client() first.")
+        
+        if clab_client.tls:
+            if clab_client.cert_path and clab_client.key_path:
+                tls_config = docker.tls.TLSConfig(
+                    client_cert=(clab_client.cert_path, clab_client.key_path),
+                    ca_cert=clab_client.ca_cert_path,
+                    verify=True
+                )
+            else:
+                tls_config = docker.tls.TLSConfig(
+                    ca_cert=clab_client.ca_cert_path,
+                    verify=True
+                )
+            base_url = f"https://{clab_client.docker_host_ip}:{clab_client.port}"
+        else:
+            tls_config = None
+            base_url = f"tcp://{clab_client.docker_host_ip}:{clab_client.port}"
+
+        # Connect to Docker daemon
+        client = docker.DockerClient(base_url=base_url, tls=tls_config)
+        
+        # Get the container
+        container = client.containers.get(container_name)
+        
+        # Construct the ip route show command with optional filtering
+        if destination_filter:
+            route_cmd = f"ip route show {destination_filter}"
+        else:
+            route_cmd = "ip route show"
+        
+        try:
+            exec_result = container.exec_run(
+                route_cmd,
+                stdout=True,
+                stderr=True
+            )
+            
+            if exec_result.exit_code == 0:
+                raw_output = exec_result.output.decode('utf-8').strip()
+                result["raw_output"] = raw_output
+                
+                # Parse the routing table output
+                routes = []
+                if raw_output:
+                    for line in raw_output.split('\n'):
+                        if line.strip():
+                            route_entry = {
+                                "raw_line": line.strip(),
+                                "destination": None,
+                                "gateway": None,
+                                "interface": None,
+                                "metric": None,
+                                "protocol": None,
+                                "scope": None
+                            }
+                            
+                            # Parse route components
+                            parts = line.strip().split()
+                            if parts:
+                                # First part is usually the destination
+                                if parts[0] in ['default', '0.0.0.0/0']:
+                                    route_entry["destination"] = "default (0.0.0.0/0)"
+                                else:
+                                    route_entry["destination"] = parts[0]
+                                
+                                # Look for key-value pairs in the route line
+                                i = 1
+                                while i < len(parts):
+                                    if parts[i] == "via" and i + 1 < len(parts):
+                                        route_entry["gateway"] = parts[i + 1]
+                                        i += 2
+                                    elif parts[i] == "dev" and i + 1 < len(parts):
+                                        route_entry["interface"] = parts[i + 1]
+                                        i += 2
+                                    elif parts[i] == "metric" and i + 1 < len(parts):
+                                        route_entry["metric"] = parts[i + 1]
+                                        i += 2
+                                    elif parts[i] == "proto" and i + 1 < len(parts):
+                                        route_entry["protocol"] = parts[i + 1]
+                                        i += 2
+                                    elif parts[i] == "scope" and i + 1 < len(parts):
+                                        route_entry["scope"] = parts[i + 1]
+                                        i += 2
+                                    else:
+                                        i += 1
+                            
+                            routes.append(route_entry)
+                
+                result["routes"] = routes
+                result["route_count"] = len(routes)
+                
+                logger.info(f"Successfully retrieved {len(routes)} routes from container {container_name}")
+                
+            else:
+                error_output = exec_result.output.decode('utf-8').strip()
+                error_msg = f"Failed to retrieve routing table: {error_output}"
+                logger.error(error_msg)
+                result["status"] = "error"
+                result["error"] = error_msg
+                return result
+                
+        except Exception as e:
+            error_msg = f"Error executing route command: {str(e)}"
+            logger.error(error_msg)
+            result["status"] = "error"
+            result["error"] = error_msg
+            return result
+        
+        return result
+        
+    except Exception as e:
+        error_msg = f"Unexpected error in check_routes: {str(e)}"
+        logger.error(error_msg)
+        return {
+            "status": "error",
+            "container": container_name,
+            "filter_applied": destination_filter,
+            "error": error_msg
+        }
+    finally:
+        if 'client' in locals():
+            client.close()
+
+@mcp.tool
+def route_delete(
+    container_name: str,
+    destination_network: str,
+    gateway_ip: Optional[str] = None,
+    interface_name: Optional[str] = None
+) -> Dict:
+    """
+    Delete a static route from a ContainerLab container's routing table.
+    
+    This tool removes specific routes from a container's routing table using the 'ip route del' command.
+    It provides flexible route deletion options by allowing specification of:
+    - Destination network only (removes all routes to that destination)
+    - Destination network with specific gateway (removes route via specific gateway)
+    - Destination network with specific interface (removes route via specific interface)
+    - Complete route specification (destination, gateway, and interface)
+    
+    This is the cleanup counterpart to add_static_route - use it to remove routes that
+    are no longer needed or were incorrectly configured. The tool handles various
+    route deletion scenarios and provides detailed feedback on the operation.
+    
+    Use this tool when you need to:
+    - Remove obsolete or incorrect static routes
+    - Clean up routing tables after network testing
+    - Modify routing configurations by removing old routes before adding new ones
+    - Troubleshoot routing issues by removing conflicting routes
+    - Restore default routing behavior by removing custom routes
+    - Prepare containers for different network configurations
+    - Remove routes that are causing connectivity problems
+    
+    The tool supports partial route specification, allowing flexible deletion of routes
+    based on available information. For example, you can delete all routes to a specific
+    destination without specifying the gateway or interface.
+    
+    Args:
+        container_name: Name of the ContainerLab container to modify routing table
+        destination_network: Target network or host in CIDR notation to remove routes for (e.g., '192.168.10.0/24', '10.0.0.1/32', '0.0.0.0/0')
+        gateway_ip: Optional gateway IP to match for route deletion (if not specified, matches any gateway)
+        interface_name: Optional interface name to match for route deletion (if not specified, matches any interface)
+        
+    Returns:
+        Dictionary containing:
+        - status: 'success' or 'error'
+        - messages: List of route deletion operations performed
+        - container, destination_network, gateway_ip, interface: Configuration details
+        - error: Error message if operation failed
+        - route_command: The exact ip route command that was executed
+        
+    Raises:
+        docker.errors.DockerException: If container is not found or not accessible
+        ValueError: If network address format is invalid
+        RuntimeError: If route deletion fails due to network constraints
+    """
+    result = {
+        "status": "success",
+        "container": container_name,
+        "destination_network": destination_network,
+        "gateway_ip": gateway_ip,
+        "interface": interface_name,
+        "messages": []
+    }
+    
+    try:
+        if clab_client is None:
+            raise RuntimeError("ContainerLab client not initialized. Call initialize_client() first.")
+        
+        if clab_client.tls:
+            if clab_client.cert_path and clab_client.key_path:
+                tls_config = docker.tls.TLSConfig(
+                    client_cert=(clab_client.cert_path, clab_client.key_path),
+                    ca_cert=clab_client.ca_cert_path,
+                    verify=True
+                )
+            else:
+                tls_config = docker.tls.TLSConfig(
+                    ca_cert=clab_client.ca_cert_path,
+                    verify=True
+                )
+            base_url = f"https://{clab_client.docker_host_ip}:{clab_client.port}"
+        else:
+            tls_config = None
+            base_url = f"tcp://{clab_client.docker_host_ip}:{clab_client.port}"
+
+        # Connect to Docker daemon
+        client = docker.DockerClient(base_url=base_url, tls=tls_config)
+        
+        # Get the container
+        container = client.containers.get(container_name)
+        
+        # Construct the ip route del command based on provided parameters
+        route_cmd_parts = ["ip", "route", "del", destination_network]
+        
+        if gateway_ip:
+            route_cmd_parts.extend(["via", gateway_ip])
+        
+        if interface_name:
+            route_cmd_parts.extend(["dev", interface_name])
+        
+        route_cmd = " ".join(route_cmd_parts)
+        result["route_command"] = route_cmd
+        
+        try:
+            exec_result = container.exec_run(route_cmd)
+            
+            if exec_result.exit_code == 0:
+                success_msg = f"Static route deleted successfully: {destination_network}"
+                if gateway_ip:
+                    success_msg += f" via {gateway_ip}"
+                if interface_name:
+                    success_msg += f" dev {interface_name}"
+                
+                result["messages"].append(success_msg)
+                logger.info(success_msg)
+            else:
+                error_output = exec_result.output.decode('utf-8').strip()
+                
+                # Check for common route deletion errors and provide helpful messages
+                if "No such process" in error_output or "ESRCH" in error_output:
+                    error_msg = f"Route to {destination_network} does not exist"
+                    if gateway_ip:
+                        error_msg += f" via gateway {gateway_ip}"
+                    if interface_name:
+                        error_msg += f" through interface {interface_name}"
+                    
+                    logger.warning(error_msg)
+                    result["status"] = "error"
+                    result["error"] = error_msg
+                    return result
+                elif "No such device" in error_output:
+                    error_msg = f"Interface {interface_name} does not exist in container {container_name}"
+                    logger.error(error_msg)
+                    result["status"] = "error"
+                    result["error"] = error_msg
+                    return result
+                elif "Invalid argument" in error_output:
+                    error_msg = f"Invalid route deletion parameters: {error_output}"
+                    logger.error(error_msg)
+                    result["status"] = "error"
+                    result["error"] = error_msg
+                    return result
+                elif "Operation not permitted" in error_output:
+                    error_msg = f"Permission denied - cannot delete route: {error_output}"
+                    logger.error(error_msg)
+                    result["status"] = "error"
+                    result["error"] = error_msg
+                    return result
+                else:
+                    error_msg = f"Failed to delete static route: {error_output}"
+                    logger.error(error_msg)
+                    result["status"] = "error"
+                    result["error"] = error_msg
+                    return result
+        except Exception as e:
+            error_msg = f"Error executing route deletion command: {str(e)}"
+            logger.error(error_msg)
+            result["status"] = "error"
+            result["error"] = error_msg
+            return result
+        
+        return result
+        
+    except Exception as e:
+        error_msg = f"Unexpected error in route_delete: {str(e)}"
+        logger.error(error_msg)
+        return {
+            "status": "error",
+            "container": container_name,
+            "destination_network": destination_network,
+            "gateway_ip": gateway_ip,
+            "interface": interface_name,
+            "error": error_msg
+        }
+    finally:
+        if 'client' in locals():
+            client.close()
+
 if __name__ == "__main__":
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='ContainerLab MCP Server')

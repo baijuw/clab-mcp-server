@@ -89,6 +89,8 @@ docker run -d -p 8989:8989 \
 
 ### Routing Configuration
 - **add_static_route** - Add static routes to container routing tables for L3 domain testing
+- **check_routes** - Retrieve and analyze container routing tables for troubleshooting
+- **route_delete** - Remove static routes from container routing tables
 
 ## Tool Details
 
@@ -220,6 +222,50 @@ Adds static routes to container routing tables for custom network topologies.
 - Custom routing policies
 - Multi-homed network configurations
 - Network segmentation and isolation
+
+#### `check_routes`
+Retrieves and analyzes the routing table from a container for network troubleshooting.
+
+**Parameters:**
+- `container_name`: Target container name
+- `destination_filter`: Optional filter for specific destinations (e.g., 'default', '192.168.10.0/24')
+
+**Returns:**
+- **Structured Route Data:** Parsed route entries with destination, gateway, interface, metric, protocol, and scope
+- **Raw Output:** Complete `ip route show` command output
+- **Route Statistics:** Total number of routes found
+- **Filter Information:** Applied destination filter details
+
+**Use Cases:**
+- **Inter-VLAN Testing:** Verify routing between different VLANs and subnets
+- **Route Validation:** Confirm static routes added with `add_static_route`
+- **Connectivity Troubleshooting:** Understand traffic flow paths in complex topologies
+- **Network Diagnostics:** Debug routing problems and validate configurations
+- **Topology Analysis:** Analyze routing paths for network optimization
+- **Gateway Verification:** Confirm default gateway and specific route configurations
+
+#### `route_delete`
+Removes static routes from a container's routing table for cleanup and reconfiguration.
+
+**Parameters:**
+- `container_name`: Target container name
+- `destination_network`: Target network in CIDR notation to remove routes for
+- `gateway_ip`: Optional gateway IP to match for route deletion (if not specified, matches any gateway)
+- `interface_name`: Optional interface name to match for route deletion (if not specified, matches any interface)
+
+**Flexible Deletion Options:**
+- **Destination Only:** Remove all routes to a specific destination (`route_delete("container1", "192.168.10.0/24")`)
+- **Destination + Gateway:** Remove route via specific gateway (`route_delete("container1", "192.168.10.0/24", "10.0.0.1")`)
+- **Destination + Interface:** Remove route via specific interface (`route_delete("container1", "192.168.10.0/24", None, "eth1.100")`)
+- **Complete Specification:** Remove exact route match (`route_delete("container1", "192.168.10.0/24", "10.0.0.1", "eth1.100")`)
+
+**Use Cases:**
+- **Route Cleanup:** Remove obsolete or incorrect static routes after testing
+- **Configuration Changes:** Remove old routes before adding new ones for reconfiguration
+- **Troubleshooting:** Remove conflicting routes that are causing connectivity problems
+- **Network Reset:** Restore default routing behavior by removing custom routes
+- **Lab Management:** Clean up routing tables between different test scenarios
+- **Error Recovery:** Remove routes that were added incorrectly or are causing issues
 
 ## Security Features
 
