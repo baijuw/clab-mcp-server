@@ -1206,6 +1206,9 @@ def get_interface_info(
                             result["interface_type"] = "vlan"
                         elif "." in interface_name:
                             result["interface_type"] = "vlan"
+                        elif interface_name.startswith("bond") or "MASTER" in interface_data.get("flags", []):
+                            # Fallback detection for bond interfaces
+                            result["interface_type"] = "bond"
                         else:
                             result["interface_type"] = "physical"
                             
