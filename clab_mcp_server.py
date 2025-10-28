@@ -12,12 +12,25 @@ import subprocess
 import sys
 import os
 import argparse
+import time
 from fastmcp import FastMCP
 
 logger = logging.getLogger(__name__)
 
 # Initialize FastMCP server
 mcp = FastMCP("ContainerLab MCP Server 🚀")
+
+# Constants for LLDP daemon operations
+LLDP_DAEMON_INIT_WAIT = 2  # seconds to wait for daemon initialization
+LLDP_NEIGHBOR_DISCOVERY_WAIT = 3  # seconds to wait for neighbor discovery
+LLDP_DAEMON_NOT_RUNNING_PATTERNS = [
+    "unable to connect to socket",
+    "unable to connect to lldpd daemon",
+    "cannot connect to lldpd",
+    "connection refused",
+    "not able to get the list of interfaces",
+    "failed to connect"
+]
 
 class ContainerLabClient:
     """
@@ -52,16 +65,48 @@ clab_client: Optional[ContainerLabClient] = None
 def initialize_client(docker_host_ip: str = None, port: int = None, tls: bool = False):
     """Initialize the global ContainerLabClient instance."""
     global clab_client
-    
+
     # Use environment variable if docker_host_ip not provided
     if docker_host_ip is None:
         docker_host_ip = os.getenv('DOCKER_HOST_IP', 'localhost')
-    
+
     # Use environment variable if port not provided
     if port is None:
         port = int(os.getenv('DOCKER_PORT', '2375'))
-    
+
     clab_client = ContainerLabClient(docker_host_ip, port, tls)
+
+def _get_docker_client():
+    """
+    Helper function to create a Docker client connection using the global clab_client configuration.
+
+    Returns:
+        docker.DockerClient: Connected Docker client instance
+
+    Raises:
+        RuntimeError: If clab_client is not initialized
+    """
+    if clab_client is None:
+        raise RuntimeError("ContainerLab client not initialized. Call initialize_client() first.")
+
+    if clab_client.tls:
+        if clab_client.cert_path and clab_client.key_path:
+            tls_config = docker.tls.TLSConfig(
+                client_cert=(clab_client.cert_path, clab_client.key_path),
+                ca_cert=clab_client.ca_cert_path,
+                verify=True
+            )
+        else:
+            tls_config = docker.tls.TLSConfig(
+                ca_cert=clab_client.ca_cert_path,
+                verify=True
+            )
+        base_url = f"https://{clab_client.docker_host_ip}:{clab_client.port}"
+    else:
+        tls_config = None
+        base_url = f"tcp://{clab_client.docker_host_ip}:{clab_client.port}"
+
+    return docker.DockerClient(base_url=base_url, tls=tls_config)
 
 @mcp.tool
 def get_clab_linux_nodes() -> List[Dict]:
@@ -1903,6 +1948,278 @@ def route_delete(
         if 'client' in locals():
             client.close()
 
+@mcp.tool
+def lldp_neighbor_discovery(
+    container_name: str
+) -> Dict:
+    """
+    Discover LLDP neighbors connected to a ContainerLab container's network interfaces.
+
+    This tool retrieves Link Layer Discovery Protocol (LLDP) neighbor information from a container,
+    providing visibility into the network topology and directly connected devices. LLDP is a
+    vendor-neutral protocol that allows network devices to advertise their identity, capabilities,
+    and neighbors on a local area network.
+
+    The tool automatically handles the complete LLDP setup process:
+    1. Attempts to query LLDP neighbors using lldpcli
+    2. If lldpcli is not installed, automatically installs the lldpd package
+    3. If the LLDP daemon is not running, starts it automatically
+    4. Retries the neighbor discovery after setup is complete
+
+    This tool is fully idempotent and can be safely run multiple times. It will reuse existing
+    installations and running daemons without causing errors or duplicate configurations.
+
+    LLDP neighbor information includes:
+    - Neighbor device chassis ID and system name
+    - Connected port identifiers and descriptions
+    - Device capabilities (router, switch, bridge, etc.)
+    - Management IP addresses
+    - VLAN information
+    - System description and version details
+
+    Use this tool when you need to:
+    - Discover the network topology around a container
+    - Verify physical/logical connectivity to network devices
+    - Identify which switch ports containers are connected to
+    - Troubleshoot network cabling and connectivity issues
+    - Validate network topology matches the intended design
+    - Gather network device information for documentation
+    - Verify LLDP is functioning properly in the lab environment
+    - Understand multi-hop network paths and device relationships
+
+    Common use cases:
+    - Network topology discovery and mapping
+    - Cable tracing and port identification
+    - Network troubleshooting and validation
+    - Lab environment verification
+    - Network device inventory and documentation
+
+    Args:
+        container_name: Name of the ContainerLab container to discover LLDP neighbors from
+
+    Returns:
+        Dictionary containing:
+        - status: 'success' or 'error'
+        - container: Container name
+        - neighbors_output: Raw output from lldpcli showing neighbor information
+        - neighbors_found: Boolean indicating if any neighbors were discovered
+        - messages: List of operations performed (installation, daemon start, etc.)
+        - lldpd_installed: Boolean indicating if lldpd was installed during this run
+        - daemon_started: Boolean indicating if lldpd daemon was started during this run
+        - error: Error message if operation failed
+
+    Raises:
+        docker.errors.DockerException: If container is not found or not accessible
+        RuntimeError: If LLDP package installation fails (may indicate proxy configuration issues)
+
+    Note:
+        If package installation fails, the container may need its proxy settings configured
+        properly to reach package repositories. Check /etc/environment and proxy configuration
+        in the container's network settings.
+    """
+    result = {
+        "status": "success",
+        "container": container_name,
+        "neighbors_output": "",
+        "neighbors_found": False,
+        "messages": [],
+        "lldpd_installed": False,
+        "daemon_started": False,
+        "error": None
+    }
+
+    try:
+        # Connect to Docker daemon using helper function
+        client = _get_docker_client()
+        container = client.containers.get(container_name)
+
+        # Step 1: Try to run lldpcli show neighbors
+        try:
+            lldp_cmd = "lldpcli show neighbors"
+            exec_result = container.exec_run(lldp_cmd, stdout=True, stderr=True)
+            output = exec_result.output.decode('utf-8').strip()
+
+            # Check if command not found (works for both busybox "not found" and bash "command not found")
+            # Note: Check output for "not found" errors, not just exit code
+            # because lldpcli returns 0 even when it can't connect to the daemon
+            # Be careful to distinguish between "lldpcli: not found" and "socket: No such file"
+            output_lower = output.lower()
+            lldpcli_not_found = (
+                "lldpcli: not found" in output_lower or
+                "lldpcli: command not found" in output_lower or
+                "/bin/sh: lldpcli: not found" in output_lower
+            )
+
+            if lldpcli_not_found:
+                msg = "lldpcli not found, installing lldpd package"
+                result["messages"].append(msg)
+                logger.info(msg)
+
+                # Step 2: Install lldpd package
+                # Try to detect the package manager and install accordingly
+                # First, try Alpine's apk
+                install_cmd = "sh -c 'if command -v apk >/dev/null 2>&1; then source /etc/environment 2>/dev/null || true; apk add lldpd; elif command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y lldpd; elif command -v yum >/dev/null 2>&1; then yum install -y lldpd; elif command -v dnf >/dev/null 2>&1; then dnf install -y lldpd; else echo \"No supported package manager found\"; exit 1; fi'"
+                exec_result = container.exec_run(install_cmd, stdout=True, stderr=True)
+                install_output = exec_result.output.decode('utf-8').strip()
+
+                if exec_result.exit_code != 0:
+                    error_msg = f"Failed to install lldpd package. The container may need proxy settings configured or lacks a supported package manager. Error: {install_output}"
+                    logger.error(error_msg)
+                    result["status"] = "error"
+                    result["error"] = error_msg
+                    result["messages"].append(error_msg)
+                    return result
+
+                result["lldpd_installed"] = True
+                success_msg = "lldpd package installed successfully"
+                result["messages"].append(success_msg)
+                logger.info(success_msg)
+
+                # Retry lldpcli command after installation
+                exec_result = container.exec_run(lldp_cmd, stdout=True, stderr=True)
+                output = exec_result.output.decode('utf-8').strip()
+                output_lower = output.lower()
+
+            # Check if daemon is not running by looking for error patterns in output
+            # Note: lldpcli can return exit code 0 even when daemon is not running!
+            needs_daemon_start = any(pattern in output_lower for pattern in LLDP_DAEMON_NOT_RUNNING_PATTERNS)
+
+            if needs_daemon_start:
+                msg = "LLDP daemon not running, starting lldpd daemon"
+                result["messages"].append(msg)
+                logger.info(msg)
+
+                # Step 3: Start the LLDP daemon
+                # Note: lldpd daemonizes itself by default (runs in background)
+                # However, when run via docker exec, we need to ensure the daemon persists
+                # after the exec session ends. Use nohup or setsid to detach from the session.
+                daemon_commands = [
+                    "setsid /usr/sbin/lldpd",
+                    "nohup /usr/sbin/lldpd >/dev/null 2>&1",
+                    "/usr/sbin/lldpd",
+                    "setsid lldpd",
+                    "nohup lldpd >/dev/null 2>&1",
+                    "lldpd"
+                ]
+                daemon_started = False
+
+                for daemon_cmd in daemon_commands:
+                    try:
+                        # Run command through shell to handle setsid/nohup
+                        exec_result = container.exec_run(
+                            f"sh -c '{daemon_cmd}'",
+                            stdout=True,
+                            stderr=True
+                        )
+
+                        # Check if command failed
+                        if exec_result.exit_code != 0:
+                            error_output = exec_result.output.decode('utf-8').strip() if exec_result.output else ""
+                            logger.warning(f"Failed to start daemon with '{daemon_cmd}': exit code {exec_result.exit_code}, output: {error_output}")
+                            continue
+
+                        # Wait for daemon to initialize
+                        time.sleep(LLDP_DAEMON_INIT_WAIT)
+
+                        # Verify daemon is actually running by checking the socket
+                        check_socket = container.exec_run("test -S /run/lldpd/lldpd.socket")
+                        if check_socket.exit_code == 0:
+                            daemon_started = True
+                            result["daemon_started"] = True
+                            success_msg = f"LLDP daemon started successfully using: {daemon_cmd}"
+                            result["messages"].append(success_msg)
+                            logger.info(success_msg)
+
+                            # Wait for LLDP to discover neighbors
+                            time.sleep(LLDP_NEIGHBOR_DISCOVERY_WAIT)
+                            break
+                        else:
+                            logger.warning(f"Daemon command '{daemon_cmd}' completed but socket not created")
+                            continue
+
+                    except Exception as daemon_err:
+                        logger.warning(f"Exception starting daemon with '{daemon_cmd}': {daemon_err}")
+                        continue
+
+                if not daemon_started:
+                    error_msg = "Failed to start LLDP daemon using any known path"
+                    logger.error(error_msg)
+                    result["status"] = "error"
+                    result["error"] = error_msg
+                    result["messages"].append(error_msg)
+                    return result
+
+                # Retry lldpcli command after starting daemon
+                exec_result = container.exec_run(lldp_cmd, stdout=True, stderr=True)
+                output = exec_result.output.decode('utf-8').strip()
+                output_lower = output.lower()
+
+            # Store the final output
+            result["neighbors_output"] = output
+
+            # Check if we successfully got neighbor information
+            # First check if there are daemon connection errors in the output
+            has_daemon_error = any(pattern in output_lower for pattern in LLDP_DAEMON_NOT_RUNNING_PATTERNS)
+
+            if has_daemon_error:
+                # Daemon still not running after all attempts
+                error_msg = f"LLDP daemon not accessible after setup attempts. Output: {output}"
+                logger.error(error_msg)
+                result["status"] = "error"
+                result["error"] = error_msg
+                result["messages"].append(error_msg)
+                return result
+            elif exec_result.exit_code == 0:
+                # Check if there are actual neighbors (not just empty output)
+                if output and "LLDP neighbors:" in output:
+                    # Check if there's actual neighbor data (more than just the header)
+                    lines = [line.strip() for line in output.split('\n') if line.strip() and not line.startswith('---')]
+                    if len(lines) > 1:  # More than just "LLDP neighbors:" line
+                        result["neighbors_found"] = True
+                        success_msg = "LLDP neighbor information retrieved successfully"
+                    else:
+                        success_msg = "LLDP query successful, but no neighbors found"
+                else:
+                    success_msg = "LLDP query completed (no neighbors detected)"
+
+                result["messages"].append(success_msg)
+                logger.info(success_msg)
+            else:
+                # Command still failed after all retry attempts
+                error_msg = f"Failed to retrieve LLDP neighbors after setup. Output: {output}"
+                logger.error(error_msg)
+                result["status"] = "error"
+                result["error"] = error_msg
+                result["messages"].append(error_msg)
+                return result
+
+        except Exception as e:
+            error_msg = f"Error during LLDP neighbor discovery: {str(e)}"
+            logger.error(error_msg)
+            result["status"] = "error"
+            result["error"] = error_msg
+            result["messages"].append(error_msg)
+            return result
+
+        return result
+
+    except Exception as e:
+        error_msg = f"Unexpected error in lldp_neighbor_discovery: {str(e)}"
+        logger.error(error_msg)
+        return {
+            "status": "error",
+            "container": container_name,
+            "neighbors_output": "",
+            "neighbors_found": False,
+            "messages": [],
+            "lldpd_installed": False,
+            "daemon_started": False,
+            "error": error_msg
+        }
+    finally:
+        if 'client' in locals():
+            client.close()
+
 if __name__ == "__main__":
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='ContainerLab MCP Server')
@@ -1916,11 +2233,11 @@ if __name__ == "__main__":
                         help='MCP server host (default: 0.0.0.0)')
     parser.add_argument('--mcp-port', type=int, default=8989,
                         help='MCP server port (default: 8989)')
-    
+
     args = parser.parse_args()
-    
+
     # Initialize the client with provided arguments
     initialize_client(docker_host_ip=args.docker_host_ip, port=args.docker_port, tls=args.docker_tls)
-    
+
     # Run the FastMCP server
     mcp.run(transport="http", host=args.mcp_host, port=args.mcp_port, log_level="debug")

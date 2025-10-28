@@ -86,6 +86,7 @@ docker run -d -p 8989:8989 \
 ### Interface Inspection & Troubleshooting
 - **get_interface_info** - Retrieve comprehensive configuration and status information for network interfaces (supports physical, VLAN, and bond interfaces)
 - **test_connectivity** - Verify network connectivity between containers using ping
+- **lldp_neighbor_discovery** - Discover LLDP neighbors and network topology around containers
 
 ### Routing Configuration
 - **add_static_route** - Add static routes to container routing tables for L3 domain testing
@@ -205,6 +206,49 @@ Tests network reachability between containers using ICMP ping.
 - Sends 3 ping packets with 2-second timeout
 - Provides detailed connectivity diagnostics
 - Includes troubleshooting guidance for common failure scenarios
+
+#### `lldp_neighbor_discovery`
+Discovers Link Layer Discovery Protocol (LLDP) neighbors connected to a container's network interfaces, providing visibility into network topology and directly connected devices.
+
+**Parameters:**
+- `container_name`: Target container name
+
+**Automatic Setup (Idempotent):**
+1. Attempts to run `lldpcli show neighbors`
+2. If lldpcli not found, automatically installs lldpd package
+3. If daemon not running, automatically starts lldpd daemon
+4. Retries neighbor discovery after setup is complete
+
+**LLDP Information Provided:**
+- Neighbor device chassis ID and system name
+- Connected port identifiers and descriptions
+- Device capabilities (router, switch, bridge, etc.)
+- Management IP addresses
+- VLAN information
+- System description and version details
+
+**Returns:**
+- `status`: 'success' or 'error'
+- `neighbors_output`: Raw LLDP output showing neighbor information
+- `neighbors_found`: Boolean indicating if neighbors were discovered
+- `messages`: List of operations performed (installation, daemon start, etc.)
+- `lldpd_installed`: Boolean indicating if lldpd was installed during this run
+- `daemon_started`: Boolean indicating if lldpd daemon was started during this run
+- `error`: Error message if operation failed
+
+**Use Cases:**
+- Network topology discovery and mapping
+- Cable tracing and port identification
+- Verifying physical/logical connectivity to network devices
+- Identifying which switch ports containers are connected to
+- Network troubleshooting and validation
+- Lab environment verification
+- Network device inventory and documentation
+
+**Important Notes:**
+- Fully idempotent - can be safely run multiple times without errors
+- If package installation fails, the container may need proxy settings configured
+- Check `/etc/environment` and proxy configuration if installation errors occur
 
 ### Routing Configuration Tools
 
